@@ -1,4 +1,4 @@
-package runtime
+package connpool
 
 import (
 	"fmt"
@@ -32,7 +32,7 @@ func NewPool(initCap, maxCap int, newFunc func() (interface{}, error)) (*Pool, e
 	for i := 0; i < initCap; i++ {
 		v, err := p.create()
 		if err != nil {
-			return p, err
+			return nil, err
 		}
 		p.store <- &item{data: v, heartbeat: time.Now()}
 	}
