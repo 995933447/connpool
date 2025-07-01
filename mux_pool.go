@@ -2,7 +2,6 @@ package connpool
 
 import (
 	"fmt"
-	"github.com/995933447/elemutil"
 	"golang.org/x/sync/singleflight"
 	"sync"
 	"sync/atomic"
@@ -10,14 +9,18 @@ import (
 )
 
 type MuxPool struct {
-	New    func() (interface{}, error)
-	Ping   func(interface{}) bool
-	Close  func(interface{})
-	Idle   time.Duration
-	store  *elemutil.LinkedList
-	mu     sync.Mutex
-	maxCap int
-	sfl    singleflight.Group
+	New                func() (interface{}, error)
+	Ping               func(interface{}) bool
+	Close              func(interface{})
+	store              []*muxItem
+	Idle               time.Duration
+	sfl                singleflight.Group
+	poolMu             sync.RWMutex
+	storeMus           []*sync.RWMutex
+	maxCap             int
+	maxPos             int
+	cap                atomic.Int32
+	doGetCountMoreThan atomic.Int32
 }
 
 type muxItem struct {
@@ -32,21 +35,28 @@ func NewMuxPool(initCap, maxCap int, newFunc func() (interface{}, error)) (*MuxP
 		return nil, fmt.Errorf("invalid capacity settings")
 	}
 	p := new(MuxPool)
-	p.store = &elemutil.LinkedList{}
+	p.doGetCountMoreThan.Store(-1)
 	p.maxCap = maxCap
+	p.store = make([]*muxItem, maxCap)
 	if newFunc != nil {
 		p.New = newFunc
+	}
+	p.storeMus = make([]*sync.RWMutex, maxCap)
+	for i := 0; i < maxCap; i++ {
+		p.storeMus[i] = &sync.RWMutex{}
 	}
 	for i := 0; i < initCap; i++ {
 		conn, err := p.create()
 		if err != nil {
 			return nil, err
 		}
-		p.store.Append(&muxItem{
+		p.store[i] = &muxItem{
 			data:      conn,
 			heartbeat: time.Now(),
-		})
+		}
 	}
+	p.cap.Store(int32(initCap))
+	p.maxPos = initCap - 1
 	return p, nil
 }
 
@@ -58,34 +68,43 @@ func (p *MuxPool) create() (interface{}, error) {
 }
 
 func (p *MuxPool) Get() (interface{}, bool, error) {
+	p.poolMu.RLock()
+	defer p.poolMu.RUnlock()
+
 	var selected *muxItem
 
-	err := p.store.Walk(func(node *elemutil.LinkedNode) (bool, error) {
-		i := node.Payload.(*muxItem)
+	capInt32 := p.cap.Load()
+	if capInt32 > 0 {
+		idx := p.doGetCountMoreThan.Add(1) / int32(p.maxPos+1)
+		for i := 0; i <= p.maxPos; i++ {
+			it := p.store[idx]
 
-		if p.Ping != nil && !p.Ping(i) {
-			p.mu.Lock()
-			defer p.mu.Unlock()
-			p.store.DeleteNode(node)
-			return true, nil
+			idx++
+			if idx > int32(p.maxPos) {
+				idx = 0
+			}
+
+			if it == nil {
+				continue
+			}
+
+			if p.Ping != nil && !p.Ping(it.data) {
+				p.remove(i)
+				continue
+			}
+
+			// 空闲链接
+			if it.refCount.Load() <= 0 {
+				selected = it
+				break
+			}
+
+			// 连接是否阻塞，如果已经阻塞（如何写入缓冲区满了），表示单连接负载高了，取其他连接
+			if !it.isBlocking {
+				selected = it
+				break
+			}
 		}
-
-		// 空闲链接
-		if i.refCount.Load() <= 0 {
-			selected = i
-			return false, nil
-		}
-
-		// 连接是否阻塞，如果已经阻塞（如何写入缓冲区满了），表示单连接负载高了，取其他连接
-		if !i.isBlocking {
-			selected = i
-			return false, nil
-		}
-
-		return true, nil
-	})
-	if err != nil {
-		return nil, false, err
 	}
 
 	if selected != nil {
@@ -93,11 +112,10 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 		return selected.data, false, nil
 	}
 
-	defer p.sfl.Forget("newConn")
-
 	var isNew bool
+	newItemAny, err, _ := p.sfl.Do("create", func() (interface{}, error) {
+		isNew = true
 
-	newItemAny, err, _ := p.sfl.Do("newConn", func() (interface{}, error) {
 		newConn, err := p.create()
 		if err != nil {
 			return nil, err
@@ -108,16 +126,39 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 			heartbeat: time.Now(),
 		}
 
-		p.mu.Lock()
-		if p.store.Len() < uint32(p.maxCap) {
-			p.store.Append(i)
+		if p.cap.Load() < int32(p.maxCap) {
+			incrMaxPos := p.maxPos + 1
+			if incrMaxPos < p.maxCap {
+				p.maxPos = incrMaxPos
+				p.store[incrMaxPos] = i
+				p.cap.Add(1)
+			} else {
+				for idx, it := range p.store {
+					if it == nil {
+						mu := p.storeMus[idx]
+						mu.Lock()
+						if it == nil {
+							p.store[idx] = i
+							p.cap.Add(1)
+							if idx > p.maxPos {
+								p.maxPos = idx
+							}
+							mu.Unlock()
+							break
+						}
+						mu.Unlock()
+					}
+				}
+			}
 		}
-		p.mu.Unlock()
-
-		isNew = true
 
 		return i, nil
 	})
+	if err != nil {
+		return nil, false, err
+	}
+
+	p.sfl.Forget("create")
 
 	newItem := newItemAny.(*muxItem)
 	newItem.refCount.Add(1)
@@ -126,26 +167,26 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 }
 
 func (p *MuxPool) Len() int {
-	if p.store == nil {
-		return 0
-	}
-	return int(p.store.Len())
+	return int(p.cap.Load())
 }
 
 func (p *MuxPool) Put(v interface{}) {
+	p.poolMu.RLock()
+	defer p.poolMu.RUnlock()
+
 	var selected *muxItem
-	_ = p.store.Walk(func(node *elemutil.LinkedNode) (bool, error) {
-		i := node.Payload.(*muxItem)
-		if i.data == v {
-			selected = i
-			return false, nil
+	for _, it := range p.store {
+		if it == nil {
+			continue
 		}
-		return true, nil
-	})
+		if it.data == v {
+			selected = it
+			break
+		}
+	}
 	if selected == nil {
 		return
 	}
-
 	selected.refCount.Add(-1)
 	selected.heartbeat = time.Now()
 	if selected.refCount.Load() <= 0 && selected.isBlocking {
@@ -153,20 +194,57 @@ func (p *MuxPool) Put(v interface{}) {
 	}
 }
 
+func (p *MuxPool) Block(v interface{}) {
+	p.poolMu.RLock()
+	defer p.poolMu.RUnlock()
+
+	var selected *muxItem
+	for _, it := range p.store {
+		if it == nil {
+			continue
+		}
+		if it.data == v {
+			selected = it
+			break
+		}
+	}
+	if selected != nil && selected.refCount.Load() > 0 && !selected.isBlocking {
+		selected.isBlocking = true
+	}
+}
+
+func (p *MuxPool) Clear() {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+
+	for _, it := range p.store {
+		if it == nil {
+			continue
+		}
+		if p.Close != nil {
+			p.Close(it.data)
+		}
+	}
+
+	p.store = make([]*muxItem, p.maxCap)
+}
+
 func (p *MuxPool) Destroy() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.store == nil || p.store.Len() == 0 {
+	p.poolMu.Lock()
+	defer p.poolMu.Unlock()
+	if p.store == nil {
 		// pool already destroyed
 		return
 	}
-	_ = p.store.Walk(func(node *elemutil.LinkedNode) (bool, error) {
-		i := node.Payload.(*muxItem)
-		if p.Close != nil {
-			p.Close(i.data)
+
+	for _, it := range p.store {
+		if it == nil {
+			continue
 		}
-		return true, nil
-	})
+		if p.Close != nil {
+			p.Close(it.data)
+		}
+	}
 	p.store = nil
 }
 
@@ -175,65 +253,65 @@ func (p *MuxPool) RegisterChecker(interval time.Duration, check func(interface{}
 		go func() {
 			for {
 				time.Sleep(interval)
-				p.mu.Lock()
+				p.poolMu.RLock()
 				if p.store == nil {
-					p.mu.Unlock()
+					p.poolMu.RUnlock()
 					return
 				}
-				p.mu.Unlock()
-				_ = p.store.Walk(func(node *elemutil.LinkedNode) (bool, error) {
-					i := node.Payload.(*muxItem)
-					if p.Idle > 0 && time.Now().Sub(i.heartbeat) > p.Idle {
-						p.mu.Lock()
-						p.store.DeleteNode(node)
-						p.mu.Unlock()
-						if p.Close != nil {
-							p.Close(i.data)
-						}
-						return true, nil
+				for i, it := range p.store {
+					if i > p.maxPos {
+						break
 					}
-					if !check(i.data) {
-						p.mu.Lock()
-						p.store.DeleteNode(node)
-						p.mu.Unlock()
+
+					if it == nil {
+						continue
+					}
+
+					if p.remove(i) {
+						continue
+					}
+
+					if p.Idle > 0 && time.Now().Sub(it.heartbeat) > p.Idle {
 						if p.Close != nil {
-							p.Close(i.data)
+							p.Close(it.data)
+						}
+						continue
+					}
+
+					if !check(it.data) {
+						if p.Close != nil {
+							p.Close(it.data)
 						}
 					}
-					return true, nil
-				})
+
+					mu := p.storeMus[i]
+					mu.Lock()
+					if p.store[i] == nil {
+						p.store[i] = it
+						mu.Unlock()
+						continue
+					}
+					mu.Unlock()
+
+					if p.Close != nil {
+						p.Close(it.data)
+					}
+				}
+				p.poolMu.RUnlock()
 			}
 		}()
 	}
 }
 
-func (p *MuxPool) Clear() {
-	if p.store == nil {
-		return
+func (p *MuxPool) remove(i int) bool {
+	var succ bool
+	mu := p.storeMus[i]
+	mu.Lock()
+	if p.store[i] != nil {
+		p.store[i] = nil
+		p.cap.Add(-1)
+		succ = true
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_ = p.store.Walk(func(node *elemutil.LinkedNode) (bool, error) {
-		i := node.Payload.(*muxItem)
-		p.store.DeleteNode(node)
-		if p.Close != nil {
-			p.Close(i.data)
-		}
-		return true, nil
-	})
-}
-
-func (p *MuxPool) Block(v interface{}) {
-	var selected *muxItem
-	_ = p.store.Walk(func(node *elemutil.LinkedNode) (bool, error) {
-		i := node.Payload.(*muxItem)
-		if i.data == v {
-			selected = i
-			return false, nil
-		}
-		return true, nil
-	})
-	if selected != nil && selected.refCount.Load() > 0 && !selected.isBlocking {
-		selected.isBlocking = true
-	}
+	mu.Unlock()
+	return succ
 }
