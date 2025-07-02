@@ -77,8 +77,8 @@ func TestMuxPool(t *testing.T) {
 		}
 		if i < 5 {
 			muxPool.Block(conn)
-			all = append(all, conn)
 		}
+		all = append(all, conn)
 		if isNew {
 			c.Add(1)
 		}
@@ -140,7 +140,7 @@ func TestMuxPool(t *testing.T) {
 }
 
 func TestMuxPool3(t *testing.T) {
-	muxPool, err := NewMuxPool(2, 10, func() (interface{}, error) {
+	muxPool, err := NewMuxPool(0, 10, func() (interface{}, error) {
 		id.Add(1)
 		return &testCase{
 			Int: id.Load(),
@@ -170,12 +170,19 @@ func TestMuxPool3(t *testing.T) {
 	fmt.Println(all)
 	fmt.Println(muxPool.Len())
 
+	for _, conn := range all {
+		muxPool.Put(conn)
+	}
+
 	muxPool.RegisterChecker(time.Millisecond, func(payload interface{}) bool {
 		fmt.Println("checker")
 		return false
 	})
 
 	time.Sleep(time.Second)
+
+	fmt.Println(muxPool.Len())
+	fmt.Println(muxPool.store)
 
 	muxPool.Get()
 	fmt.Println(muxPool.Len())
