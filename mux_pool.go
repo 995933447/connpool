@@ -67,6 +67,24 @@ func (p *MuxPool) create() (interface{}, error) {
 	return p.New()
 }
 
+func (p *MuxPool) check(i int, it *muxItem) bool {
+	if it == nil {
+		return false
+	}
+
+	if p.Ping != nil && !p.Ping(it.data) {
+		p.remove(i)
+		return false
+	}
+
+	// 空闲链接,或者连接是否阻塞，如果已经阻塞（如何写入缓冲区满了），表示单连接负载高了，取其他连接
+	if it.refCount.Load() <= 0 || !it.isBlocking {
+		return true
+	}
+
+	return false
+}
+
 func (p *MuxPool) Get() (interface{}, bool, error) {
 	p.poolMu.RLock()
 	defer p.poolMu.RUnlock()
@@ -75,32 +93,25 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 
 	capInt32 := p.cap.Load()
 	if capInt32 > 0 {
-		idx := p.doGetCountMoreThan.Add(1) / int32(p.maxPos+1)
-		for i := 0; i <= p.maxPos; i++ {
-			it := p.store[idx]
-
-			idx++
-			if idx > int32(p.maxPos) {
-				idx = 0
-			}
-
-			if it == nil {
-				continue
-			}
-
-			if p.Ping != nil && !p.Ping(it.data) {
-				p.remove(i)
-				continue
-			}
-
-			// 空闲链接
-			if it.refCount.Load() <= 0 {
+		if p.maxPos == 0 {
+			it := p.store[0]
+			if it != nil && p.check(0, it) {
 				selected = it
-				break
 			}
+		} else {
+			idx := p.doGetCountMoreThan.Add(1) % int32(p.maxPos)
+			for i := 0; i <= p.maxPos; i++ {
+				it := p.store[idx]
 
-			// 连接是否阻塞，如果已经阻塞（如何写入缓冲区满了），表示单连接负载高了，取其他连接
-			if !it.isBlocking {
+				idx++
+				if idx > int32(p.maxPos) {
+					idx = 0
+				}
+
+				if !p.check(int(idx-1), it) {
+					continue
+				}
+
 				selected = it
 				break
 			}
@@ -128,7 +139,7 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 
 		if p.cap.Load() < int32(p.maxCap) {
 			incrMaxPos := p.maxPos + 1
-			if incrMaxPos < p.maxCap {
+			if incrMaxPos < p.maxCap && p.cap.Load() > int32(p.maxPos)/2 {
 				p.maxPos = incrMaxPos
 				p.store[incrMaxPos] = i
 				p.cap.Add(1)
@@ -217,10 +228,14 @@ func (p *MuxPool) Clear() {
 	p.poolMu.Lock()
 	defer p.poolMu.Unlock()
 
-	for _, it := range p.store {
+	p.cap.Store(0)
+	p.maxPos = 0
+
+	for i, it := range p.store {
 		if it == nil {
 			continue
 		}
+		p.remove(i)
 		if p.Close != nil {
 			p.Close(it.data)
 		}
@@ -232,6 +247,10 @@ func (p *MuxPool) Clear() {
 func (p *MuxPool) Destroy() {
 	p.poolMu.Lock()
 	defer p.poolMu.Unlock()
+
+	p.maxPos = 0
+	p.cap.Store(0)
+
 	if p.store == nil {
 		// pool already destroyed
 		return
@@ -267,11 +286,12 @@ func (p *MuxPool) RegisterChecker(interval time.Duration, check func(interface{}
 						continue
 					}
 
-					if p.remove(i) {
+					if it.refCount.Load() > 0 {
 						continue
 					}
 
 					if p.Idle > 0 && time.Now().Sub(it.heartbeat) > p.Idle {
+						p.remove(i)
 						if p.Close != nil {
 							p.Close(it.data)
 						}
@@ -279,22 +299,14 @@ func (p *MuxPool) RegisterChecker(interval time.Duration, check func(interface{}
 					}
 
 					if !check(it.data) {
+						if it.refCount.Load() > 0 {
+							continue
+						}
+
+						p.remove(i)
 						if p.Close != nil {
 							p.Close(it.data)
 						}
-					}
-
-					mu := p.storeMus[i]
-					mu.Lock()
-					if p.store[i] == nil {
-						p.store[i] = it
-						mu.Unlock()
-						continue
-					}
-					mu.Unlock()
-
-					if p.Close != nil {
-						p.Close(it.data)
 					}
 				}
 				p.poolMu.RUnlock()
