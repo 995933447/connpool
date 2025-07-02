@@ -77,7 +77,7 @@ func (p *MuxPool) check(i int, it *muxItem) bool {
 		return false
 	}
 
-	// 空闲链接,或者连接是否阻塞，如果已经阻塞（如何写入缓冲区满了），表示单连接负载高了，取其他连接
+	// 空闲链接,或者连接是否阻塞，如果已经阻塞（比如socket写入缓冲区满了），表示单连接负载高了，取其他连接
 	if it.refCount.Load() <= 0 || !it.isBlocking {
 		return true
 	}
