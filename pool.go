@@ -103,10 +103,10 @@ func (p *Pool) Get() (interface{}, bool, error) {
 			if p.Ping != nil && !p.Ping(v) {
 				continue
 			}
-			return v, true, nil
+			return v, false, nil
 		default:
 			x, y := p.create()
-			return x, false, y
+			return x, true, y
 		}
 	}
 }
