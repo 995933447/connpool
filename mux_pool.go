@@ -9,18 +9,19 @@ import (
 )
 
 type MuxPool struct {
-	New                func() (interface{}, error)
-	Ping               func(interface{}) bool
-	Close              func(interface{})
-	store              []*muxItem
-	Idle               time.Duration
-	sfl                singleflight.Group
-	poolMu             sync.RWMutex
-	storeMus           []*sync.RWMutex
-	maxCap             int
-	maxPos             int
-	cap                atomic.Int32
-	doGetCountMoreThan atomic.Int32
+	New                 func() (interface{}, error)
+	Ping                func(interface{}) bool
+	Close               func(interface{})
+	store               []*muxItem
+	Idle                time.Duration
+	sfl                 singleflight.Group
+	poolMu              sync.RWMutex
+	storeMus            []*sync.RWMutex
+	maxCap              int
+	maxPos              int
+	cap                 atomic.Int32
+	doGetCountMoreThan  atomic.Int32
+	maxRefCountEachConn int32
 }
 
 type muxItem struct {
@@ -30,13 +31,14 @@ type muxItem struct {
 	heartbeat  time.Time
 }
 
-func NewMuxPool(initCap, maxCap int, newFunc func() (interface{}, error)) (*MuxPool, error) {
+func NewMuxPool(initCap, maxCap int, maxRefCountEachConn int32, newFunc func() (interface{}, error)) (*MuxPool, error) {
 	if maxCap == 0 || initCap > maxCap {
 		return nil, fmt.Errorf("invalid capacity settings")
 	}
 	p := new(MuxPool)
 	p.doGetCountMoreThan.Store(-1)
 	p.maxCap = maxCap
+	p.maxRefCountEachConn = maxRefCountEachConn
 	p.store = make([]*muxItem, maxCap)
 	if newFunc != nil {
 		p.New = newFunc
@@ -77,7 +79,11 @@ func (p *MuxPool) check(i int, it *muxItem) bool {
 		return false
 	}
 
-	// 空闲链接,或者连接是否阻塞，如果已经阻塞（比如socket写入缓冲区满了），表示单连接负载高了，取其他连接
+	if p.maxRefCountEachConn > 0 && it.refCount.Load() > p.maxRefCountEachConn {
+		return false
+	}
+
+	// 空闲链接,或者连接是否阻塞，如果已经阻塞（如何写入缓冲区满了），表示单连接负载高了，取其他连接
 	if it.refCount.Load() <= 0 || !it.isBlocking {
 		return true
 	}
@@ -103,12 +109,13 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 			for i := 0; i <= p.maxPos; i++ {
 				it := p.store[idx]
 
+				oriIdx := idx
 				idx++
 				if idx > int32(p.maxPos) {
 					idx = 0
 				}
 
-				if !p.check(int(idx-1), it) {
+				if !p.check(int(oriIdx), it) {
 					continue
 				}
 
@@ -120,7 +127,7 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 
 	if selected != nil {
 		selected.refCount.Add(1)
-		return selected.data, false, nil
+		return selected.data, true, nil
 	}
 
 	var isNew bool
@@ -174,7 +181,7 @@ func (p *MuxPool) Get() (interface{}, bool, error) {
 	newItem := newItemAny.(*muxItem)
 	newItem.refCount.Add(1)
 
-	return newItem.data, isNew, nil
+	return newItem.data, !isNew, nil
 }
 
 func (p *MuxPool) Len() int {
